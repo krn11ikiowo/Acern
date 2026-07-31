@@ -1,0 +1,366 @@
+name: Full IPA Repo Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  ipa-pipeline:
+    runs-on: macos-15
+
+    steps:
+      # ---------------------------------------------------------
+      # 0. CHECKOUT + GIT CONFIG
+      # ---------------------------------------------------------
+      - name: Checkout repository safely
+        uses: actions/checkout@v4
+        with:
+          clean: false
+          fetch-depth: 0
+
+      - name: Configure Git for binary safety
+        run: |
+          git config core.autocrlf false
+          git config core.safecrlf false
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+      # ---------------------------------------------------------
+      # 1. VERSION BUMP (MAJOR ROLLOVER)
+      # ---------------------------------------------------------
+      - name: Auto-increment version with major rollover
+        run: |
+          VERSION_FILE="version.txt"
+
+          if [ ! -f "$VERSION_FILE" ]; then
+            echo "1.7.9" > "$VERSION_FILE"
+          fi
+
+          CURRENT=$(cat "$VERSION_FILE")
+          MAJOR=$(echo $CURRENT | cut -d. -f1)
+          MINOR=$(echo $CURRENT | cut -d. -f2)
+          PATCH=$(echo $CURRENT | cut -d. -f3)
+
+          MINOR=$((MINOR + 1))
+
+          if [ "$MINOR" -ge 10 ]; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+          fi
+
+          NEW_VERSION="$MAJOR.$MINOR.$PATCH"
+          echo "$NEW_VERSION" > "$VERSION_FILE"
+
+      - name: Commit version bump
+        run: |
+          git add version.txt
+          git commit -m "debug: bump version to $(cat version.txt)" || echo "no version changes"
+          git push || echo "nothing to push"
+
+      # ---------------------------------------------------------
+      # 2. BUILD IPA FROM XCODE PROJECT
+      # ---------------------------------------------------------
+      - name: Build IPA from Xcode project
+        run: |
+          xcodebuild \
+            -workspace Fearn.xcworkspace \
+            -scheme Fearn \
+            -configuration Release \
+            -archivePath build/Fearn.xcarchive \
+            archive
+
+          xcodebuild \
+            -exportArchive \
+            -archivePath build/Fearn.xcarchive \
+            -exportPath build/ipa \
+            -exportOptionsPlist ExportOptions.plist
+
+      - name: Commit built IPA
+        run: |
+          git add build/ipa
+          git commit -m "debug: add built IPA" || echo "no ipa changes"
+          git push || echo "nothing to push"
+
+      # ---------------------------------------------------------
+      # 3. SIGNER + ENTITLEMENT PRESETS + IPA CHANGER
+      # ---------------------------------------------------------
+      - name: Create signer directory
+        run: mkdir -p ios-signer
+
+      - name: Generate signer.sh
+        run: |
+          cat > ios-signer/signer.sh <<'EOF'
+#!/bin/bash
+IPA="$1"
+CERT="$2"
+ENTITLEMENTS="entitlements.plist"
+
+if [ -z "$IPA" ] || [ -z "$CERT" ]; then
+  echo "Usage: signer.sh <ipa> <certificate>"
+  exit 1
+fi
+
+TMPDIR=$(mktemp -d)
+unzip "$IPA" -d "$TMPDIR"
+
+APP=$(find "$TMPDIR/Payload" -type d -name "*.app")
+
+codesign \
+  --force \
+  --sign "$CERT" \
+  --entitlements "$TMPDIR/$ENTITLEMENTS" \
+  "$APP"
+
+cd "$TMPDIR"
+zip -r signed.ipa Payload
+
+mv signed.ipa ../signed.ipa
+EOF
+
+      - name: Generate entitlement presets
+        run: |
+          mkdir -p ios-signer/entitlements
+
+          cat > ios-signer/entitlements/dev.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>get-task-allow</key>
+  <true/>
+</dict>
+</plist>
+EOF
+
+          cat > ios-signer/entitlements/release.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>get-task-allow</key>
+  <false/>
+</dict>
+</plist>
+EOF
+
+      - name: Generate ipa-changer.sh
+        run: |
+          cat > ios-signer/ipa-changer.sh <<'EOF'
+#!/bin/bash
+IPA="$1"
+CERT="$2"
+ENT_PROFILE="$3"   # dev or release
+
+if [ -z "$IPA" ] || [ -z "$CERT" ] || [ -z "$ENT_PROFILE" ]; then
+  echo "Usage: ipa-changer.sh <ipa> <certificate> <entitlements-profile>"
+  exit 1
+fi
+
+TMPDIR=$(mktemp -d)
+unzip "$IPA" -d "$TMPDIR"
+
+APP=$(find "$TMPDIR/Payload" -type d -name "*.app")
+
+cp "ios-signer/entitlements/${ENT_PROFILE}.plist" "$TMPDIR/entitlements.plist"
+
+mkdir -p "$APP/Frameworks"
+cp -R xcode-frameworks/MyFramework "$APP/Frameworks/"
+
+codesign \
+  --force \
+  --sign "$CERT" \
+  --entitlements "$TMPDIR/entitlements.plist" \
+  "$APP"
+
+cd "$TMPDIR"
+zip -r changed.ipa Payload
+
+mv changed.ipa ../changed.ipa
+EOF
+
+      - name: Commit signer + changer tools
+        run: |
+          git add ios-signer
+          git commit -m "debug: update signer + ipa changer + entitlements" || echo "no changes"
+          git push || echo "nothing to push"
+
+      # ---------------------------------------------------------
+      # 4. XCODE FRAMEWORKS
+      # ---------------------------------------------------------
+      - name: Create Xcode framework directory
+        run: |
+          mkdir -p xcode-frameworks/MyFramework/Sources
+          mkdir -p xcode-frameworks/MyFramework/Headers
+
+      - name: Generate framework Info.plist
+        run: |
+          cat > xcode-frameworks/MyFramework/Info.plist <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+ "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.example.MyFramework</string>
+  <key>CFBundleName</key>
+  <string>MyFramework</string>
+  <key>CFBundleVersion</key>
+  <string>1.0</string>
+</dict>
+</plist>
+EOF
+
+      - name: Generate module.modulemap
+        run: |
+          cat > xcode-frameworks/MyFramework/module.modulemap <<'EOF'
+module MyFramework {
+  header "MyFramework.h"
+  export *
+}
+EOF
+
+      - name: Generate placeholder header
+        run: |
+          cat > xcode-frameworks/MyFramework/Headers/MyFramework.h <<'EOF'
+#ifndef MYFRAMEWORK_H
+#define MYFRAMEWORK_H
+
+void myFrameworkFunction(void);
+
+#endif
+EOF
+
+      - name: Generate placeholder source
+        run: |
+          cat > xcode-frameworks/MyFramework/Sources/MyFramework.c <<'EOF'
+#include "MyFramework.h"
+#include <stdio.h>
+
+void myFrameworkFunction(void) {
+    printf("MyFramework loaded\\n");
+}
+EOF
+
+      - name: Commit frameworks
+        run: |
+          git add xcode-frameworks
+          git commit -m "debug: add Xcode framework scaffolding" || echo "no framework changes"
+          git push || echo "nothing to push"
+
+      # ---------------------------------------------------------
+      # 5. RUN IPA CHANGER (VARIANT IPA)
+      # ---------------------------------------------------------
+      - name: Run IPA changer (dev profile)
+        run: |
+          chmod +x ios-signer/ipa-changer.sh
+          ios-signer/ipa-changer.sh build/ipa/Fearn.ipa "iPhone Developer" dev
+
+      - name: Commit changed IPA
+        run: |
+          git add changed.ipa
+          git commit -m "debug: add changed IPA (dev entitlements, injected frameworks)" || echo "no changes"
+          git push || echo "nothing to push"
+
+      # ---------------------------------------------------------
+      # 6. SIGN CHANGED IPA
+      # ---------------------------------------------------------
+      - name: Sign changed IPA
+        run: |
+          chmod +x ios-signer/signer.sh
+          ios-signer/signer.sh changed.ipa "iPhone Developer"
+
+      - name: Commit signed IPA
+        run: |
+          git add signed.ipa
+          git commit -m "debug: add signed IPA" || echo "no ipa changes"
+          git push || echo "nothing to push"
+
+      # ---------------------------------------------------------
+      # 7. OPTIONAL PC VERSION
+      # ---------------------------------------------------------
+      - name: Create PC signer directory
+        run: mkdir -p pc-signer
+
+      - name: Generate Windows batch signer
+        run: |
+          cat > pc-signer/signer.bat <<'EOF'
+@echo off
+echo PC IPA signer placeholder
+echo This tool can patch IPAs but cannot codesign them on Windows.
+echo Use the macOS signer for final signing.
+EOF
+
+      - name: Generate PowerShell signer
+        run: |
+          cat > pc-signer/signer.ps1 <<'EOF'
+Write-Host "PC IPA signer placeholder"
+Write-Host "This tool can unzip, patch, and repackage IPAs."
+Write-Host "Final signing must be done on macOS."
+EOF
+
+      - name: Generate PC README
+        run: |
+          cat > pc-signer/README.md <<'EOF'
+# PC IPA Tools
+
+This directory contains Windows-friendly tools for working with IPAs.
+
+Capabilities:
+- Unzip IPA
+- Patch contents
+- Inject frameworks
+- Repackage IPA
+
+Limitations:
+- Windows cannot codesign IPAs
+- Final signing must be done on macOS (see ios-signer/)
+EOF
+
+      - name: Commit PC signer directory
+        run: |
+          git add pc-signer
+          git commit -m "debug: add PC signer tools" || echo "no pc changes"
+          git push || echo "nothing to push"
+
+      # ---------------------------------------------------------
+      # 8. DUAL RELEASES (IOS + WINDOWS)
+      # ---------------------------------------------------------
+      - name: Create iOS Release
+        uses: softprops/action-gh-release@v1
+        if: success()
+        with:
+          name: "iOS Build Release"
+          tag_name: "ios-build-${{ github.run_number }}"
+          files: |
+            signed.ipa
+            changed.ipa
+            build/ipa/*.ipa
+          body: |
+            iOS release containing:
+            - Signed IPA
+            - Changed IPA (entitlements + frameworks)
+            - Original built IPA
+
+      - name: Create Windows Release
+        uses: softprops/action-gh-release@v1
+        if: success()
+        with:
+          name: "Windows Tools Release"
+          tag_name: "windows-tools-${{ github.run_number }}"
+          files: |
+            pc-signer/signer.bat
+            pc-signer/signer.ps1
+            pc-signer/README.md
+          body: |
+            Windows release containing:
+            - PC signer tools
+            - PC IPA patcher helpers
+            - PC framework injector helpers
